@@ -1,0 +1,65 @@
+#include <msp430.h>
+
+#define RED_LED BIT0  //P1.0 - Red LED
+#define GREEN_LED BIT7 //P1.7 - Green LED
+#define LEFT_BUTTON BIT3 //P1.3 - Left Pushbutton
+#define RIGHT_BUTTON BIT4 // P1.4 - Right pushbutton
+
+void delay(); //Function prototype for delay
+
+int main(void) {
+    WDTCTL = WDTPW | WDTHOLD; //Stop watchdog timer
+    PM5CTL0 &= ~LOCKLPM5; //Unlock GPIO
+
+    //Configure LED pins as outputs
+    P1DIR |= RED_LED;
+    P1OUT &= ~(RED_LED); //Ensure red LED start OFF
+
+    P9DIR |= GREEN_LED;
+    P9OUT &= ~(GREEN_LED); //Ensure green LED starts OFF
+
+    //Configure pushbutton pins as inputs with pull-up resistors
+    P1DIR &= ~(LEFT_BUTTON | RIGHT_BUTTON); //Set buttons as inputs
+    P1REN |= (LEFT_BUTTON | RIGHT_BUTTON); //Enable pull-up resistors
+    P1OUT |= (LEFT_BUTTON | RIGHT_BUTTON); //Pull-up enabled
+
+    while (1) {
+        int leftPressed = !(P1IN & LEFT_BUTTON); //Active LOW, so the logics inverted
+        int rightPressed = !(P1IN & RIGHT_BUTTON);
+
+        if (leftPressed && rightPressed) {
+            //Both buttons pressed - Blink LED's alternately
+            P1OUT ^= RED_LED; //Toggle red LED ON
+            delay();
+            P1OUT ^= RED_LED; //Toggle red LED OFF
+            P9OUT ^= GREEN_LED; //Toggle green LED ON
+            delay();
+            P9OUT ^= GREEN_LED; //Toggle green LED OFF
+        }
+
+        else if (leftPressed) {
+            //Left button pressed - Blink red LED
+            P1OUT ^= RED_LED;
+            delay();
+            P1OUT ^= RED_LED;
+            delay();
+        }
+        else if (tightPressed) {
+            //Right button pressed - Blink green LED
+            P9OUT ^= GREEN_LED;
+            delay();
+            P9OUT ^= GREEN_LED;
+            delay();
+        }
+        else {
+            //No button pressed, turn off LEDs
+            P1OUT &= ~(RED_LED | GREEN_LED);
+        }
+    }
+}
+
+//delay function
+void delay() {
+    volatile unsigned int i;
+    for (i = 30000; i > 0; i--); //software delay loop
+}
