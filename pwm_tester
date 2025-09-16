@@ -1,0 +1,32 @@
+#include <msp430fr6989.h>
+
+#define PWM_PERIOD 1000u   // 1 kHz PWM @ ~1 MHz SMCLK
+
+int main(void){
+    WDTCTL  = WDTPW | WDTHOLD;     // stop watchdog
+    PM5CTL0 &= ~LOCKLPM5;          // unlock GPIO (FRAM devices)
+
+    // --- Route TB0.6 to P2.7 ---
+    P2DIR  |= BIT7;                // output
+    P2SEL1 &= ~BIT7;               // SEL1=0
+    P2SEL0 |=  BIT7;               // SEL0=1  -> primary function = TB0.6
+
+    // --- Timer_B0 setup: SMCLK, up mode ---
+    TB0CCR0  = PWM_PERIOD - 1;     // period
+    TB0CCTL6 = OUTMOD_7;           // reset/set PWM
+    TB0CCR6  = PWM_PERIOD / 10;    // start ~10% duty
+    TB0CTL   = TBSSEL_2 | MC_1 | TBCLR;  // SMCLK, up mode, clear
+
+    // --- Fade up/down by changing duty (CCR6) ---
+    for(;;){
+        unsigned int d;
+        for(d = 0; d <= PWM_PERIOD; d += 10){
+            TB0CCR6 = d;
+            __delay_cycles(4000);  // adjust fade speed
+        }
+        for(d = PWM_PERIOD; d > 0; d -= 10){
+            TB0CCR6 = d;
+            __delay_cycles(4000);
+        }
+    }
+}
