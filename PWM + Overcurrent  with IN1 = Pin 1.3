@@ -1,0 +1,215 @@
+#include <msp430fr6989.h>
+
+/* ===== USER TUNABLES ===== */
+#define PWM_PERIOD        1000u      /* ~1 kHz @ ~1 MHz SMCLK */
+#define DUTY_FORWARD      700u
+#define DUTY_TURN         900u
+#define CYCLES_CAL_1FT    2000000u   /* tune for ~1 ft */
+#define CYCLES_CAL_TURN90 2000000u   /* tune for ~90° */
+
+static void delay_ms(unsigned int ms){ while(ms--) __delay_cycles(1000); }
+
+/* ===== YOUR WIRING =====
+   IN1 = P1.3  (CHANGED from P1.5)
+   IN2 = P2.4
+   IN3 = P2.5 (broken, pulled low)
+   IN4 = P2.6
+   ENA = P3.3 (TA1.1)  -> ALTERNATE mapping (SEL1=1, SEL0=0)
+   ENB = P3.6 (TB0.2)  -> ALTERNATE mapping (SEL1=1, SEL0=0)
+
+   eCOMP current sense:
+   Left motor sense (SENSA shunt node)  -> P8.4  (C7)
+   Right motor sense (SENSB shunt node) -> P8.5  (C6)
+
+   Restart button: S1 = P1.1 (active low)
+*/
+
+/* -------- Direction helpers (MATCH YOUR FORWARD: IN2 & IN4 HIGH) -------- */
+static void coast_all(void){
+    P1OUT &= ~BIT3;   /* IN1=0 (P1.3) */
+    P2OUT &= ~BIT4;   /* IN2=0 */
+    P2OUT &= ~BIT6;   /* IN4=0 (IN3 already 0) */
+}
+
+static void forward_both(void){
+    /* Motor A forward (your polarity): IN1=0, IN2=1 */
+    P1OUT &= ~BIT3;   /* IN1=0 */
+    P2OUT |=  BIT4;   /* IN2=1 */
+
+    /* Motor B forward-only: IN3=0, IN4=1 */
+    P2OUT |=  BIT6;   /* IN4=1 */
+}
+
+static void pivot_left_in_place(void){
+    /* Motor A reverse (opposite of your forward): IN1=1, IN2=0 */
+    P1OUT |=  BIT3;   /* IN1=1 */
+    P2OUT &= ~BIT4;   /* IN2=0 */
+
+    /* Motor B forward: IN3=0, IN4=1 */
+    P2OUT |=  BIT6;   /* IN4=1 */
+}
+
+static void brake_short(void){
+    /* A: active brake (IN1=1 & IN2=1), B: adds drag (IN3=0 so not true brake) */
+    P1OUT |=  BIT3;   /* IN1=1 */
+    P2OUT |=  BIT4;   /* IN2=1 */
+    P2OUT |=  BIT6;   /* IN4=1 */
+    delay_ms(80);
+    coast_all();
+}
+
+/* -------- Init -------- */
+static void io_init(void){
+    PM5CTL0 &= ~LOCKLPM5;
+
+    /* IN pins as GPIO */
+    P1DIR |= BIT3;                 /* IN1 on P1.3 */
+    P1SEL0 &= ~BIT3; 
+    P1SEL1 &= ~BIT3;
+
+    P2DIR  |= BIT4 | BIT6;         /* IN2, IN4 */
+    P2SEL0 &= ~(BIT4 | BIT6); 
+    P2SEL1 &= ~(BIT4 | BIT6);
+
+    /* IN3 broken: input + pulldown so it stays 0 */
+    P2DIR &= ~BIT5; 
+    P2REN |=  BIT5; 
+    P2OUT &= ~BIT5;
+
+    /* Button S1 (P1.1) input with pull-up */
+    P1DIR &= ~BIT1;
+    P1REN |=  BIT1;
+    P1OUT |=  BIT1;
+
+    coast_all();
+}
+
+static void timers_init(void){
+    /* TA1 -> ENA (CCR1) */
+    TA1CCR0  = PWM_PERIOD - 1;
+    TA1CCTL1 = OUTMOD_7;
+    TA1CCR1  = 0;
+    TA1CTL   = TASSEL_2 | MC_1 | TACLR;
+
+    /* TB0 -> ENB (CCR2) + CCR0 used as 1ms heartbeat */
+    TB0CCR0  = PWM_PERIOD - 1;     /* also ~1 kHz timebase */
+    TB0CCTL2 = OUTMOD_7;
+    TB0CCR2  = 0;
+    TB0CTL   = TBSSEL_2 | MC_1 | TBCLR;
+}
+
+static void en_map_alternate(void){
+    /* ENA: P3.3 -> TA1.1 */
+    P3DIR  |= BIT3;  P3SEL0 &= ~BIT3;  P3SEL1 |=  BIT3;
+    /* ENB: P3.6 -> TB0.2 */
+    P3DIR  |= BIT6;  P3SEL0 &= ~BIT6;  P3SEL1 |=  BIT6;
+}
+
+static void set_ena(unsigned int d){ if(d>PWM_PERIOD) d=PWM_PERIOD; TA1CCR1 = d; }
+static void set_enb(unsigned int d){ if(d>PWM_PERIOD) d=PWM_PERIOD; TB0CCR2 = d; }
+
+/* ---------------- SAFETY: eCOMP + fault latch ---------------- */
+#define OC_PERSIST_MS  50u
+
+static volatile unsigned char fault_latched = 0;
+static volatile unsigned int  oc_count_A = 0, oc_count_B = 0;
+static volatile unsigned char mux_sel = 0;
+
+static inline void emergency_stop(void){
+    set_ena(0);
+    set_enb(0);
+    coast_all();
+    fault_latched = 1;
+}
+
+static void ecomp_pins_init(void){
+    P8SEL0 |= BIT4 | BIT5;  /* P8.4=C7, P8.5=C6 analog mode */
+    P8SEL1 |= BIT4 | BIT5;
+}
+
+static void ecomp_init(void){
+    CECTL1 = CEPWRMD_2;                        /* normal power mode */
+    CECTL0 = CEIPEN | CEIPSEL_7 | CEIMEN;      /* +input=C7 start, -input=ref */
+    CECTL2 = CEREFL_2 | CERS_1 | CEREF0_8;     /* ~0.25*Vcc reference */
+    CECTL1 |= CEON;                            /* turn on comparator */
+}
+
+static void safety_timer_init(void){
+    TB0CCTL0 = CCIE;   /* enable CCR0 interrupt at ~1 kHz */
+}
+
+/* Try to clear fault if S1 button is held for ~1s */
+static void clear_fault_if_button(void){
+    static unsigned int hold = 0;
+    if(!(P1IN & BIT1)){        /* button pressed (active low) */
+        if(++hold >= 1000){
+            fault_latched = 0;
+            oc_count_A = oc_count_B = 0;
+            hold = 0;
+        }
+    } else {
+        hold = 0;
+    }
+}
+
+/* ---------------- Main ---------------- */
+int main(void){
+    WDTCTL = WDTPW | WDTHOLD;
+
+    io_init();
+    timers_init();
+    en_map_alternate();
+
+    ecomp_pins_init();
+    ecomp_init();
+    safety_timer_init();
+
+    /* Movement sequence */
+    forward_both();
+    set_ena(DUTY_FORWARD);
+    set_enb(DUTY_FORWARD);
+    __delay_cycles(CYCLES_CAL_1FT);
+
+    brake_short();
+    delay_ms(150);
+
+    pivot_left_in_place();
+    set_ena(DUTY_TURN);
+    set_enb(DUTY_TURN);
+    __delay_cycles(CYCLES_CAL_TURN90);
+
+    coast_all();
+    set_ena(0);
+    set_enb(0);
+
+    while(1){ __no_operation(); }
+}
+
+/* ---------------- ISRs ---------------- */
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt void TB0_CCR0_ISR(void){
+    unsigned char oc_now = (CECTL1 & CEOUT) ? 0u : 1u;
+
+    if(!mux_sel){
+        if(oc_now){ if(oc_count_A < 0xFFFF) ++oc_count_A; } else oc_count_A = 0;
+    } else {
+        if(oc_now){ if(oc_count_B < 0xFFFF) ++oc_count_B; } else oc_count_B = 0;
+    }
+
+    if(!fault_latched && (oc_count_A >= OC_PERSIST_MS || oc_count_B >= OC_PERSIST_MS)){
+        emergency_stop();
+    }
+
+    if(fault_latched){
+        clear_fault_if_button();
+    }
+
+    mux_sel ^= 1u;
+    if(!mux_sel){
+        CECTL0 = (CECTL0 & ~0x1F) | CEIPSEL_7 | CEIPEN | CEIMEN;  /* C7 */
+    } else {
+        CECTL0 = (CECTL0 & ~0x1F) | CEIPSEL_6 | CEIPEN | CEIMEN;  /* C6 */
+    }
+
+    TB0CCTL0 &= ~CCIFG;
+}
