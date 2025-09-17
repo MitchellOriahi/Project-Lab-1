@@ -1,0 +1,122 @@
+#include <msp430fr6989.h>
+
+/* ===== USER TUNABLES ===== */
+#define PWM_PERIOD        1000u      /* ~1 kHz @ ~1 MHz SMCLK */
+#define DUTY_FORWARD      700u
+#define DUTY_TURN         900u
+#define CYCLES_CAL_1FT    2000000u   /* tune for ~1 ft */
+#define CYCLES_CAL_TURN90 2000000u   /* tune for ~90° */
+
+static void delay_ms(unsigned int ms){ while(ms--) __delay_cycles(1000); }
+
+/* ===== YOUR WIRING =====
+   IN1 = P1.5, IN2 = P2.4, IN3 = P2.5 (broken, pulled low), IN4 = P2.6
+   ENA = P3.3 (TA1.1)  -> ALTERNATE mapping (SEL1=1, SEL0=0)
+   ENB = P3.6 (TB0.2)  -> ALTERNATE mapping (SEL1=1, SEL0=0)
+*/
+
+/* -------- Direction helpers (MATCH YOUR FORWARD: IN2 & IN4 HIGH) -------- */
+static void coast_all(void){
+    P1OUT &= ~BIT5;   /* IN1=0 */
+    P2OUT &= ~BIT4;   /* IN2=0 */
+    P2OUT &= ~BIT6;   /* IN4=0 (IN3 already 0) */
+}
+
+/* Forward both = A forward via IN2=1 (IN1=0), B forward via IN4=1 (IN3=0) */
+static void forward_both(void){
+    /* Motor A forward (your polarity): IN1=0, IN2=1 */
+    P1OUT &= ~BIT5;
+    P2OUT |=  BIT4;
+
+    /* Motor B forward-only: IN3=0, IN4=1 */
+    P2OUT |=  BIT6;
+}
+
+/* Pivot left in place = A reverse (IN1=1, IN2=0) + B forward (IN4=1) */
+static void pivot_left_in_place(void){
+    /* Motor A reverse (opposite of your forward): IN1=1, IN2=0 */
+    P1OUT |=  BIT5;
+    P2OUT &= ~BIT4;
+
+    /* Motor B forward: IN3=0, IN4=1 */
+    P2OUT |=  BIT6;
+}
+
+static void brake_short(void){          /* optional snappy stop */
+    P1OUT |=  BIT5;   /* A: IN1=1 */
+    P2OUT |=  BIT4;   /* A: IN2=1  (active brake on A) */
+    P2OUT |=  BIT6;   /* B: IN4=1  (adds drag; IN3 is 0) */
+    delay_ms(80);
+    coast_all();
+}
+
+/* -------- Init -------- */
+static void io_init(void){
+    PM5CTL0 &= ~LOCKLPM5;
+
+    /* IN pins as GPIO */
+    P1DIR |= BIT5; P1SEL0 &= ~BIT5; P1SEL1 &= ~BIT5;         /* IN1 */
+    P2DIR |= BIT4 | BIT6;                                     /* IN2, IN4 */
+    P2SEL0 &= ~(BIT4 | BIT6); P2SEL1 &= ~(BIT4 | BIT6);
+
+    /* IN3 broken: input + pulldown so it stays 0 */
+    P2DIR &= ~BIT5; P2REN |= BIT5; P2OUT &= ~BIT5;
+
+    coast_all();
+}
+
+static void timers_init(void){
+    /* TA1 -> ENA (CCR1) */
+    TA1CCR0  = PWM_PERIOD - 1;
+    TA1CCTL1 = OUTMOD_7;
+    TA1CCR1  = 0;
+    TA1CTL   = TASSEL_2 | MC_1 | TACLR;
+
+    /* TB0 -> ENB (CCR2) */
+    TB0CCR0  = PWM_PERIOD - 1;
+    TB0CCTL2 = OUTMOD_7;
+    TB0CCR2  = 0;
+    TB0CTL   = TBSSEL_2 | MC_1 | TBCLR;
+}
+
+/* EN pins: ALTERNATE function mapping (SEL1=1, SEL0=0) */
+static void en_map_alternate(void){
+    /* ENA: P3.3 -> TA1.1 */
+    P3DIR  |= BIT3;  P3SEL0 &= ~BIT3;  P3SEL1 |=  BIT3;
+    /* ENB: P3.6 -> TB0.2 */
+    P3DIR  |= BIT6;  P3SEL0 &= ~BIT6;  P3SEL1 |=  BIT6;
+}
+
+static void set_ena(unsigned int d){ if(d>PWM_PERIOD) d=PWM_PERIOD; TA1CCR1 = d; }
+static void set_enb(unsigned int d){ if(d>PWM_PERIOD) d=PWM_PERIOD; TB0CCR2 = d; }
+
+/* -------- Main -------- */
+int main(void){
+    WDTCTL = WDTPW | WDTHOLD;
+
+    io_init();
+    timers_init();
+    en_map_alternate();
+
+    /* 1) Forward ~1 ft (IN2 & IN4 high via helpers) */
+    forward_both();
+    set_ena(DUTY_FORWARD);
+    set_enb(DUTY_FORWARD);
+    __delay_cycles(CYCLES_CAL_1FT);
+
+    brake_short();
+    delay_ms(150);
+
+    /* 2) Pivot ~90° left: A reverse + B forward */
+    pivot_left_in_place();
+    set_ena(DUTY_TURN);
+    set_enb(DUTY_TURN);
+    __delay_cycles(CYCLES_CAL_TURN90);
+
+    /* 3) Stop */
+    coast_all();
+    set_ena(0);
+    set_enb(0);
+
+    while(1){ __no_operation(); }
+}
