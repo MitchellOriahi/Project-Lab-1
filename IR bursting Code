@@ -1,0 +1,67 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ===== User config ===== */
+#define SMCLK_HZ    1000000UL      /* FR6989 default ~1 MHz */
+#define PWM_HZ      38000UL        /* 38 kHz carrier frequency */
+#define BURST_HZ    1000UL         /* 1 kHz burst rate (0.5 ms ON / 0.5 ms OFF) */
+
+/* Try primary function first. If no output, set to 1 to use the alternate mux. */
+#define USE_ALT_MUX 1
+
+/* Derived values */
+#define PWM_PERIOD   ((SMCLK_HZ / PWM_HZ) - 1)   // ~26 counts for 38 kHz
+#define PWM_DUTY     (PWM_PERIOD / 2)            // ~50%
+#define BURST_PERIOD (SMCLK_HZ / (BURST_HZ * 2)) // half-period delay (~0.5 ms)
+
+/* ---- Route P3.3 to TA1.1 ---- */
+static void map_p33_to_ta11(void)
+{
+    P3DIR |= BIT3;   /* output */
+
+#if USE_ALT_MUX
+    /* Alternate mapping */
+    P3SEL0 &= ~BIT3;
+    P3SEL1 |=  BIT3;
+#else
+    /* Primary mapping (most boards) */
+    P3SEL0 |=  BIT3;
+    P3SEL1 &= ~BIT3;
+#endif
+}
+
+/* ---- Timer_A1 PWM on CCR1 (TA1.1) ---- */
+static void ta1_start_pwm(void)
+{
+    TA1CCR0  = PWM_PERIOD;                   /* PWM period */
+    TA1CCTL1 = OUTMOD_7;                     /* reset/set = square PWM */
+    TA1CCR1  = PWM_DUTY;                     /* ~50% duty */
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;  /* SMCLK, up mode, clear */
+}
+
+/* ---- Enable or disable PWM output ---- */
+static inline void pwm_on(void)  { TA1CCTL1 = OUTMOD_7; }
+static inline void pwm_off(void) { TA1CCTL1 = 0; P3OUT &= ~BIT3; }
+
+/* ---- Simple delay ---- */
+static void delay_cycles_custom(uint32_t cycles)
+{
+    while (cycles--) __no_operation();
+}
+
+int main(void)
+{
+    WDTCTL  = WDTPW | WDTHOLD;   /* stop watchdog */
+    PM5CTL0 &= ~LOCKLPM5;        /* unlock GPIOs */
+
+    map_p33_to_ta11();
+    ta1_start_pwm();
+
+    while (1)
+    {
+        pwm_on();                              /* emit 38 kHz carrier */
+        delay_cycles_custom(BURST_PERIOD);     /* for ~0.5 ms */
+        pwm_off();                             /* stop carrier */
+        delay_cycles_custom(BURST_PERIOD);     /* idle ~0.5 ms */
+    }
+}
