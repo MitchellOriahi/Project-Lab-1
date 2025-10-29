@@ -1,0 +1,87 @@
+#include <msp430fr6989.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* === User Tunables === */
+#define PWM_PERIOD   1000u
+#define DUTY_FORWARD 700u
+#define DUTY_TURN    900u
+
+#define TSOP_PIN  BIT1  // P2.1 IR input (active LOW)
+#define BIT_TIME_MS 10
+#define CMD_RUN_MS 700
+
+/* === Motor pin mapping === */
+#define ENA BIT7   // P2.7 -> TB0.6
+#define ENB BIT6   // P3.6 -> TB0.2
+#define IN1 BIT2   // P2.2
+#define IN2 BIT4   // P2.4
+#define IN3 BIT3   // P1.3
+#define IN4 BIT3   // P2.3
+
+/* === Bit patterns === */
+const uint8_t FWD_CODE[6]  = {1,1,0,0,1,1};
+const uint8_t BACK_CODE[6] = {1,0,1,0,1,0};
+const uint8_t LEFT_CODE[6] = {1,1,1,0,0,0};
+const uint8_t RIGHT_CODE[6]= {1,0,0,1,1,1};
+
+/* === Delay helper === */
+static void delay_ms(uint16_t ms){ while(ms--) __delay_cycles(1000000UL/1000); }
+
+/* === PWM init for ENA/ENB === */
+static void pwm_init(void){
+    /* ENA: P2.7 TB0.6 */
+    P2DIR |= ENA; P2SEL0 |= ENA; P2SEL1 &= ~ENA;
+    /* ENB: P3.6 TB0.2 (alternate mapping) */
+    P3DIR |= ENB; P3SEL0 &= ~ENB; P3SEL1 |= ENB;
+    TB0CCR0  = PWM_PERIOD - 1;
+    TB0CCTL2 = OUTMOD_7; TB0CCR2 = 0;
+    TB0CCTL6 = OUTMOD_7; TB0CCR6 = 0;
+    TB0CTL   = TBSSEL__SMCLK | MC__UP | TBCLR;
+}
+
+/* === Movement helpers === */
+static void coast_all(void){ P2OUT &= ~(BIT2|BIT4|BIT3); P1OUT &= ~BIT3; }
+static void forward_both(void){ P2OUT &= ~BIT2; P2OUT |= BIT4; P1OUT &= ~BIT3; P2OUT |= BIT3; }
+static void backward_both(void){ P2OUT |= BIT2; P2OUT &= ~BIT4; P1OUT |= BIT3; P2OUT &= ~BIT3; }
+static void pivot_left_in_place(void){ P2OUT |= BIT2; P2OUT &= ~BIT4; P1OUT &= ~BIT3; P2OUT |= BIT3; }
+static void pivot_right_in_place(void){ P2OUT &= ~BIT2; P2OUT |= BIT4; P1OUT |= BIT3; P2OUT &= ~BIT3; }
+
+static void set_ena(unsigned int d){ if(d>PWM_PERIOD)d=PWM_PERIOD; TB0CCR6=d; }
+static void set_enb(unsigned int d){ if(d>PWM_PERIOD)d=PWM_PERIOD; TB0CCR2=d; }
+
+/* === IR reading + decode === */
+static uint8_t bit_buffer[6]; static uint8_t bit_index=0;
+static uint8_t read_bit(void){ return (P2IN & TSOP_PIN)?0:1; }
+
+static bool match_pattern(const uint8_t *p){
+    uint8_t i; for(i=0;i<6;i++) if(bit_buffer[i]!=p[i]) return false;
+    return true;
+}
+
+static void decode_command(void){
+    if(match_pattern(FWD_CODE)){ forward_both(); set_ena(DUTY_FORWARD); set_enb(DUTY_FORWARD); delay_ms(CMD_RUN_MS); }
+    else if(match_pattern(BACK_CODE)){ backward_both(); set_ena(DUTY_FORWARD); set_enb(DUTY_FORWARD); delay_ms(CMD_RUN_MS); }
+    else if(match_pattern(LEFT_CODE)){ pivot_left_in_place(); set_ena(DUTY_TURN); set_enb(DUTY_TURN); delay_ms(CMD_RUN_MS); }
+    else if(match_pattern(RIGHT_CODE)){ pivot_right_in_place(); set_ena(DUTY_TURN); set_enb(DUTY_TURN); delay_ms(CMD_RUN_MS); }
+    coast_all(); set_ena(0); set_enb(0);
+}
+
+/* === Main === */
+int main(void){
+    WDTCTL = WDTPW | WDTHOLD; PM5CTL0 &= ~LOCKLPM5;
+
+    /* GPIO directions */
+    P2DIR |= (BIT2|BIT4|BIT3); P1DIR |= BIT3; coast_all();
+    pwm_init();
+
+    /* TSOP input */
+    P2DIR &= ~TSOP_PIN; P2REN |= TSOP_PIN; P2OUT |= TSOP_PIN;
+
+    while(1){
+        uint8_t b = read_bit();
+        bit_buffer[bit_index++] = b;
+        if(bit_index>=6){ decode_command(); bit_index=0; }
+        delay_ms(BIT_TIME_MS);
+    }
+}
