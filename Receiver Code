@@ -1,0 +1,414 @@
+// ======================================
+//      RX SIDE - MSP430FR6989
+//      IR decode via 10ms sampling
+//      ENA: P2.7 / TB0.6
+//      ENB: P3.3 / TA1.1
+// ======================================
+#include <msp430fr6989.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================
+   USER TUNABLE PARAMETERS
+   ============================================================ */
+#define PWM_PERIOD        1000u      // ~1 kHz PWM
+#define DUTY_DRIVE        700u
+#define DUTY_TURN         700u
+
+#define BIT_TIME_MS       10u        // IR bit time (MUST match TX)
+#define OC_PERSIST_MS     50u        // Overcurrent persistence threshold
+
+/* ============================================================
+   IR COMMAND PATTERNS (MUST MATCH TX)
+   ============================================================ */
+static const uint8_t CODE_FWD[6]    = {1,1,0,0,1,1};
+static const uint8_t CODE_BACK[6]   = {1,0,1,0,1,0};
+static const uint8_t CODE_LEFT[6]   = {1,1,1,0,0,0};
+static const uint8_t CODE_RIGHT[6]  = {1,0,0,1,1,1};
+static const uint8_t CODE_CLEAR[6]  = {0,1,1,1,0,0};
+static const uint8_t CODE_ATTACK[6] = {0,1,1,0,1,1};
+
+
+/* ============================================================
+   PIN DEFINITIONS (FR6989)
+   ============================================================ */
+
+/* H-Bridge Direction Pins */
+#define L_IN1      BIT2     // P2.2 -> IN1 (left motor)
+#define L_IN2      BIT3     // P1.3 -> IN2 (left motor)
+#define R_IN1      BIT7     // P3.7 -> IN3 (right motor)
+#define R_IN2      BIT6     // P3.6 -> IN4 (right motor)
+
+/* H-Bridge Enable Pins (PWM) */
+#define ENA        BIT7     // P2.7 -> TB0.6 (left enable)
+#define ENB        BIT3     // P3.3 -> TA1.1 (right enable)  *** MOVED ***
+
+/* Hammer MOSFET Gate */
+#define HAMMER_GATE BIT4    // P2.4
+
+/* Overcurrent Sense Inputs */
+#define SENSE_A    BIT4     // P8.4 (C7)
+#define SENSE_B    BIT5     // P8.5 (C6)
+
+/* IR Receiver (TSOP) */
+#define IR_IN      BIT2     // P3.2 (TSOP output, active LOW)
+
+/* Fault LED */
+#define LED_FAULT  BIT1     // P1.1 (fault latch indicator)
+
+/* Debug LEDs for bits */
+#define LED_BIT0   BIT0     // P1.0 -> lights when sampled bit = 0
+#define LED_BIT1   BIT7     // P9.7 -> lights when sampled bit = 1
+
+/* ============================================================
+   GLOBAL VARIABLES
+   ============================================================ */
+static volatile unsigned char fault_latched = 0;
+static volatile unsigned int  oc_count_A = 0;
+static volatile unsigned int  oc_count_B = 0;
+static volatile unsigned char mux_sel = 0;
+
+/* IR bit buffer */
+static uint8_t bit_buffer[6];
+static uint8_t bit_index = 0;
+
+/* ============================================================
+   UTILITY DELAY
+   ============================================================ */
+static void delay_ms(uint16_t ms)
+{
+    while(ms--)
+        __delay_cycles(1000);
+}
+
+/* ============================================================
+   MOTOR CONTROL FUNCTIONS
+   ============================================================ */
+static void coast_all(void)
+{
+    P2OUT &= ~L_IN1;
+    P1OUT &= ~L_IN2;
+    P3OUT &= ~(R_IN1 | R_IN2);
+}
+
+static void drive_forward(void)
+{
+    P2OUT &= ~L_IN1;
+    P1OUT |=  L_IN2;
+
+    P3OUT |=  R_IN1;
+    P3OUT &= ~R_IN2;
+}
+
+static void drive_back(void)
+{
+    P2OUT |=  L_IN1;
+    P1OUT &= ~L_IN2;
+
+    P3OUT &= ~R_IN1;
+    P3OUT |=  R_IN2;
+}
+
+static void drive_left(void)
+{
+    P2OUT |=  L_IN1;    // left backward
+    P1OUT &= ~L_IN2;
+
+    P3OUT |=  R_IN1;    // right forward
+    P3OUT &= ~R_IN2;
+}
+
+static void drive_right(void)
+{
+    P2OUT &= ~L_IN1;    // left forward
+    P1OUT |=  L_IN2;
+
+    P3OUT &= ~R_IN1;    // right backward
+    P3OUT |=  R_IN2;
+}
+
+static void set_ena(uint16_t d)
+{
+    if(d > PWM_PERIOD) d = PWM_PERIOD;
+    TB0CCR6 = d;                  // TB0.6 on P2.7
+}
+
+static void set_enb(uint16_t d)
+{
+    if(d > PWM_PERIOD) d = PWM_PERIOD;
+    TA1CCR1 = d;                  // TA1.1 on P3.3 (ENB)
+}
+
+/* ============================================================
+   HAMMER MOTOR CONTROL
+   ============================================================ */
+static void hammer_on(void)
+{
+    P2OUT |= HAMMER_GATE;
+}
+
+static void hammer_off(void)
+{
+    P2OUT &= ~HAMMER_GATE;
+}
+
+/* ============================================================
+   FAULT HANDLING
+   ============================================================ */
+static inline void emergency_stop(void)
+{
+    set_ena(0);
+    set_enb(0);
+    coast_all();
+    hammer_off();
+
+    fault_latched = 1;
+    P1OUT |= LED_FAULT;
+}
+
+static void clear_fault(void)
+{
+    fault_latched = 0;
+    oc_count_A = 0;
+    oc_count_B = 0;
+
+    P1OUT &= ~LED_FAULT;
+    hammer_off();
+    coast_all();
+}
+
+/* ============================================================
+   INITIALIZATION
+   ============================================================ */
+static void io_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    PM5CTL0 &= ~LOCKLPM5;
+
+    /* Fault + debug LEDs */
+    P1DIR |= (LED_FAULT | LED_BIT0);
+    P1OUT &= ~(LED_FAULT | LED_BIT0);
+
+    P9DIR |= LED_BIT1;
+    P9OUT &= ~LED_BIT1;
+
+    /* Motor direction pins */
+    P2DIR |= L_IN1;
+    P1DIR |= L_IN2;
+    P3DIR |= (R_IN1 | R_IN2);
+
+    /* Hammer gate */
+    P2DIR |= HAMMER_GATE;
+    hammer_off();
+
+    /* IR receiver: input with pull-up to avoid floating when idle */
+    P3DIR &= ~IR_IN;
+    P3REN |= IR_IN;      // enable resistor
+    P3OUT |= IR_IN;      // pull-up (TSOP pulls low on IR)
+
+    /* Sense pins analog mode */
+    P8DIR  &= ~(SENSE_A | SENSE_B);
+    P8SEL0 |=  (SENSE_A | SENSE_B);
+    P8SEL1 |=  (SENSE_A | SENSE_B);
+
+    coast_all();
+}
+
+/* ENA: TB0.6 (P2.7)  ENB: TA1.1 (P3.3) */
+static void timers_init(void)
+{
+    /* ---------- TB0 for ENA + overcurrent timer ---------- */
+    // ENA on P2.7 (TB0.6)
+    P2DIR  |= ENA;
+    P2SEL0 |= ENA;
+    P2SEL1 &= ~ENA;
+
+    TB0CCR0  = PWM_PERIOD - 1;
+    TB0CCTL0 = CCIE;           // 1 kHz overcurrent check
+
+    TB0CCTL6 = OUTMOD_7;
+    TB0CCR6  = 0;              // ENA duty
+
+    TB0CTL   = TBSSEL__SMCLK | MC__UP | TBCLR;
+
+    /* ---------- TA1 for ENB ---------- */
+    // Map P3.3 -> TA1.1 (ALT mux, like emitter)
+    P3DIR  |= ENB;
+    P3SEL0 &= ~ENB;
+    P3SEL1 |=  ENB;
+
+    TA1CCR0  = PWM_PERIOD - 1;
+    TA1CCTL1 = OUTMOD_7;
+    TA1CCR1  = 0;              // ENB duty
+
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+static void ecomp_init(void)
+{
+    CECTL1  = CEPWRMD_2;                    // normal power mode
+    CECTL0  = CEIPEN | CEIPSEL_7 | CEIMEN;  // +input = C7 initially
+    CECTL2  = CEREFL_2 | CERS_1 | CEREF0_12;// adjust threshold if needed
+    CECTL1 |= CEON;                         // enable comparator
+}
+
+/* ============================================================
+   IR DECODE (SIMPLE 10 MS SAMPLING)
+   ============================================================ */
+
+/* Read one "bit": TSOP active LOW, so:
+   IR present  -> output LOW -> bit = 1
+   IR absent   -> output HIGH -> bit = 0 */
+static uint8_t read_ir_bit(void)
+{
+    if(P3IN & IR_IN)
+        return 0;
+    else
+        return 1;
+}
+
+/* Compare bit_buffer[0..5] with pattern */
+static uint8_t match_pattern(const uint8_t *pattern)
+{
+    uint8_t i;
+    for(i = 0; i < 6; i++)
+    {
+        if(bit_buffer[i] != pattern[i])
+            return 0;
+    }
+    return 1;
+}
+
+/* Decode one 6-bit command from bit_buffer – original behavior */
+static void decode_command(void)
+{
+    /* CLEAR always honored */
+    if(match_pattern(CODE_CLEAR))
+    {
+        clear_fault();
+        return;
+    }
+
+    /* If in fault, ignore other commands */
+    if(fault_latched)
+        return;
+
+    if(match_pattern(CODE_FWD))
+    {
+        drive_forward();
+        set_ena(DUTY_DRIVE);
+        set_enb(DUTY_DRIVE);
+    }
+    else if(match_pattern(CODE_BACK))
+    {
+        drive_back();
+        set_ena(DUTY_DRIVE);
+        set_enb(DUTY_DRIVE);
+    }
+    else if(match_pattern(CODE_LEFT))
+    {
+        drive_left();
+        set_ena(DUTY_TURN);
+        set_enb(DUTY_TURN);
+    }
+    else if(match_pattern(CODE_RIGHT))
+    {
+        drive_right();
+        set_ena(DUTY_TURN);
+        set_enb(DUTY_TURN);
+    }
+    else if(match_pattern(CODE_ATTACK))
+    {
+        hammer_on();
+    }
+}
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+int main(void)
+{
+    io_init();
+    timers_init();
+    ecomp_init();
+
+    while(1)
+    {
+        uint8_t bit;
+
+        /* Sample IR every 10 ms (like TX) */
+        bit = read_ir_bit();
+
+        /* Debug LEDs: show each sampled bit */
+        if(bit == 0)
+        {
+            P1OUT |= LED_BIT0;
+            P9OUT &= ~LED_BIT1;
+        }
+        else
+        {
+            P1OUT &= ~LED_BIT0;
+            P9OUT |= LED_BIT1;
+        }
+
+        bit_buffer[bit_index++] = bit;
+
+        if(bit_index >= 6)
+        {
+            decode_command();
+            bit_index = 0;
+        }
+
+        delay_ms(BIT_TIME_MS);
+    }
+}
+
+/* ============================================================
+   OVERCURRENT ISR
+   ============================================================ */
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt void TB0_CCR0_ISR(void)
+{
+    unsigned char oc_now;
+
+    oc_now = (CECTL1 & CEOUT) ? 0u : 1u;
+
+    if(!mux_sel)
+    {
+        if(oc_now)
+        {
+            if(oc_count_A < 0xFFFF) oc_count_A++;
+        }
+        else
+        {
+            oc_count_A = 0;
+        }
+    }
+    else
+    {
+        if(oc_now)
+        {
+            if(oc_count_B < 0xFFFF) oc_count_B++;
+        }
+        else
+        {
+            oc_count_B = 0;
+        }
+    }
+
+    if(!fault_latched &&
+       (oc_count_A >= OC_PERSIST_MS || oc_count_B >= OC_PERSIST_MS))
+    {
+        emergency_stop();
+    }
+
+    /* Toggle between C7 and C6 */
+    mux_sel ^= 1u;
+
+    if(!mux_sel)
+        CECTL0 = (CECTL0 & ~0x1F) | CEIPSEL_7 | CEIPEN | CEIMEN; // SenA
+    else
+        CECTL0 = (CECTL0 & ~0x1F) | CEIPSEL_6 | CEIPEN | CEIMEN; // SenB
+
+    TB0CCTL0 &= ~CCIFG;
+}
