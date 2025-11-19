@@ -1,0 +1,156 @@
+#include <msp430.h>
+#include <stdint.h>
+
+/* ===================== IR / Timing ====================== */
+#define SMCLK_HZ       1000000UL
+#define PWM_HZ         38000UL
+#define PWM_PERIOD     ((SMCLK_HZ / PWM_HZ) - 1)   // ~26 counts for 38 kHz
+#define PWM_DUTY       (PWM_PERIOD / 2)            // 50% duty
+
+#define BIT_TIME_MS    10
+
+/* Use the SAME mapping that worked before */
+#define USE_ALT_MUX    1
+
+/* ===================== Button Assignments ======================
+   IR LED carrier:  P3.3  (TA1.1)
+
+   FWD    -> P3.7
+   BACK   -> P2.2
+   LEFT   -> P2.7
+   RIGHT  -> P2.6
+   CLEAR  -> P2.3
+   ATTACK -> P3.1
+   =========================================================== */
+
+#define BTN_FWD_P3     BIT7    // P3.7
+#define BTN_BACK_P2    BIT2    // P2.2
+#define BTN_LEFT_P2    BIT7    // P2.7
+#define BTN_RIGHT_P2   BIT6    // P2.6
+#define BTN_CLEAR_P2   BIT3    // P2.3
+#define BTN_ATTACK_P3  BIT1    // P3.1
+
+#define IR_PIN         BIT3    // P3.3
+
+/* ===================== 6-bit command codes ====================== */
+static const uint8_t CODE_FWD[6]    = {1,1,0,0,1,1};
+static const uint8_t CODE_BACK[6]   = {1,0,1,0,1,0};
+static const uint8_t CODE_LEFT[6]   = {1,1,1,0,0,0};
+static const uint8_t CODE_RIGHT[6]  = {1,0,0,1,1,1};
+static const uint8_t CODE_CLEAR[6]  = {0,1,1,1,0,0};
+static const uint8_t CODE_ATTACK[6] = {0,1,1,0,1,1};
+
+
+/* ===================== Delay ====================== */
+static void delay_ms(uint16_t ms)
+{
+    while (ms--)
+        __delay_cycles(1000);   // 1 ms @ 1 MHz
+}
+
+/* ===================== P3.3 -> TA1.1 mapping (EXACTLY LIKE OLD CODE) ====================== */
+static void map_p33_to_ta11(void)
+{
+    P3DIR |= IR_PIN;   // output
+
+#if USE_ALT_MUX
+    // Alternate mapping (same as your working code)
+    P3SEL0 &= ~IR_PIN;
+    P3SEL1 |=  IR_PIN;
+#else
+    // Primary mapping
+    P3SEL0 |=  IR_PIN;
+    P3SEL1 &= ~IR_PIN;
+#endif
+}
+
+/* ===================== Timer_A1 PWM on CCR1 ====================== */
+static void ta1_init_pwm(void)
+{
+    TA1CCR0  = PWM_PERIOD;               // PWM period (38 kHz)
+    TA1CCR1  = PWM_DUTY;                 // 50% duty
+
+    // Start with carrier OFF: OUTMOD_0 (static out bit)
+    TA1CCTL1 = OUTMOD_0;
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+
+    // Force IR pin low when "off"
+    TA1CCTL1 &= ~OUT;
+    P3OUT    &= ~IR_PIN;
+}
+
+static inline void carrier_on(void)
+{
+    // Enable 38 kHz PWM
+    TA1CCTL1 = OUTMOD_7;   // reset/set
+}
+
+static inline void carrier_off(void)
+{
+    // Disable PWM, hold line low
+    TA1CCTL1 = OUTMOD_0;
+    TA1CCTL1 &= ~OUT;
+    P3OUT    &= ~IR_PIN;
+}
+
+/* ===================== GPIO / Buttons ====================== */
+static void gpio_init(void)
+{
+    /* Port 3 buttons: FWD (P3.7), ATTACK (P3.1) */
+    P3DIR &= ~(BTN_FWD_P3 | BTN_ATTACK_P3);
+    P3REN |=  (BTN_FWD_P3 | BTN_ATTACK_P3);
+    P3OUT &= ~(BTN_FWD_P3 | BTN_ATTACK_P3);   // pulldown
+
+    /* Port 2 buttons: BACK, LEFT, RIGHT, CLEAR */
+    P2DIR &= ~(BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2);
+    P2REN |=  (BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2);
+    P2OUT &= ~(BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2);
+}
+
+/* ===================== Send a 6-bit frame ====================== */
+static void send_pattern(const uint8_t* p)
+{
+    uint8_t i;
+
+    for (i = 0; i < 6; i++)
+    {
+        if (p[i])
+            carrier_on();   // TSOP sees IR = bit 1
+        else
+            carrier_off();  // no IR = bit 0
+
+        delay_ms(BIT_TIME_MS);
+    }
+
+    carrier_off();              // idle
+    delay_ms(2 * BIT_TIME_MS);  // gap between frames
+}
+
+/* ===================== MAIN ====================== */
+int main(void)
+{
+    WDTCTL  = WDTPW | WDTHOLD;
+    PM5CTL0 &= ~LOCKLPM5;       // unlock GPIOs
+
+    map_p33_to_ta11();          // EXACT mapping like old working demo
+    ta1_init_pwm();
+    gpio_init();
+
+    delay_ms(50);               // let receiver settle
+
+    while (1)
+    {
+        if (P3IN & BTN_FWD_P3)
+            send_pattern(CODE_FWD);
+        else if (P2IN & BTN_BACK_P2)
+            send_pattern(CODE_BACK);
+        else if (P2IN & BTN_LEFT_P2)
+            send_pattern(CODE_LEFT);
+        else if (P2IN & BTN_RIGHT_P2)
+            send_pattern(CODE_RIGHT);
+        else if (P2IN & BTN_CLEAR_P2)
+            send_pattern(CODE_CLEAR);
+        else if (P3IN & BTN_ATTACK_P3)
+            send_pattern(CODE_ATTACK);
+    }
+}
