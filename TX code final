@@ -1,0 +1,154 @@
+#include <msp430fr6989.h>
+#include <stdint.h>
+
+/* ===================== IR / Timing ====================== */
+#define SMCLK_HZ       1000000UL      // 1 MHz
+#define PWM_HZ         38000UL        // 38 kHz carrier
+#define PWM_PERIOD     ((SMCLK_HZ / PWM_HZ) - 1)   // ~26
+#define PWM_DUTY       (PWM_PERIOD / 2)            // 50% duty
+
+#define BIT_TIME_MS    10             // 10 ms per bit
+#define USE_ALT_MUX    1              // P3.3 → TA1.1 alternate mapping
+
+/* ===================== Button Assignments ====================== */
+#define BTN_FWD_P3     BIT7    // P3.7
+#define BTN_BACK_P2    BIT2    // P2.2
+#define BTN_LEFT_P2    BIT7    // P2.7
+#define BTN_RIGHT_P2   BIT6    // P2.6
+#define BTN_CLEAR_P2   BIT3    // P2.3 (STOP)
+#define BTN_ATTACK_P3  BIT1    // P3.1 (HAMMER CMD)
+
+#define IR_PIN         BIT3    // P3.3 → TA1.1
+
+/* ===================== 6-bit command codes ====================== */
+/* Must match RX patterns exactly */
+static const uint8_t CODE_FWD[6]    = {1,0,1,1,1,0};   // 101110
+static const uint8_t CODE_BACK[6]   = {0,1,0,0,1,1};   // 010011
+static const uint8_t CODE_LEFT[6]   = {1,1,1,0,0,1};   // 111001
+static const uint8_t CODE_RIGHT[6]  = {0,0,0,1,1,0};   // 000110
+static const uint8_t CODE_STOP[6]   = {1,0,0,1,0,1};   // 100101
+static const uint8_t CODE_HAMMER[6] = {1,0,1,0,0,0};   // 011010
+
+/* ===================== Delay ====================== */
+static void delay_ms(uint16_t ms)
+{
+    while (ms--)
+        __delay_cycles(1000);   // 1 ms @ 1 MHz
+}
+
+/* ===================== P3.3 → TA1.1 mapping ====================== */
+static void map_p33_to_ta11(void)
+{
+    P3DIR |= IR_PIN;
+#if USE_ALT_MUX
+    P3SEL0 &= ~IR_PIN;
+    P3SEL1 |=  IR_PIN;
+#else
+    P3SEL0 |=  IR_PIN;
+    P3SEL1 &= ~IR_PIN;
+#endif
+}
+
+/* ===================== Timer_A1 38 kHz PWM ====================== */
+static void ta1_init_pwm(void)
+{
+    TA1CCR0  = PWM_PERIOD;
+    TA1CCR1  = PWM_DUTY;
+    TA1CCTL1 = OUTMOD_0;                  // start with output low
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+    P3OUT &= ~IR_PIN;
+}
+
+static inline void carrier_on(void)   { TA1CCTL1 = OUTMOD_7; }   // reset/set → 38 kHz
+static inline void carrier_off(void)  { TA1CCTL1 = OUTMOD_0; P3OUT &= ~IR_PIN; }
+
+/* ===================== Buttons (pull-down) ====================== */
+static void gpio_init(void)
+{
+    // Port 3 buttons
+    P3DIR &= ~(BTN_FWD_P3 | BTN_ATTACK_P3);
+    P3REN |=  (BTN_FWD_P3 | BTN_ATTACK_P3);
+    P3OUT &= ~(BTN_FWD_P3 | BTN_ATTACK_P3);    // pull-down
+
+    // Port 2 buttons
+    P2DIR &= ~(BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2);
+    P2REN |=  (BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2);
+    P2OUT &= ~(BTN_BACK_P2 | BTN_LEFT_P2 | BTN_RIGHT_P2 | BTN_CLEAR_P2); // pull-down
+}
+
+/* ===================== Send one 6-bit frame ====================== */
+static void send_pattern(const uint8_t* p)
+{
+    uint8_t i;
+
+    for (i = 0; i < 6; i++)
+    {
+        if (p[i])
+            carrier_on();
+        else
+            carrier_off();
+
+        delay_ms(BIT_TIME_MS);      // 10 ms per bit
+    }
+
+    carrier_off();
+    delay_ms(5);   // short gap
+}
+
+/* ===================== MAIN ====================== */
+int main(void)
+{
+    WDTCTL  = WDTPW | WDTHOLD;
+    PM5CTL0 &= ~LOCKLPM5;
+
+    map_p33_to_ta11();
+    ta1_init_pwm();
+    gpio_init();
+
+    delay_ms(50);                   // let receiver wake up
+
+    // Edge-detect states
+    uint8_t prev_fwd    = 0;
+    uint8_t prev_back   = 0;
+    uint8_t prev_left   = 0;
+    uint8_t prev_right  = 0;
+    uint8_t prev_clear  = 0;
+    uint8_t prev_attack = 0;
+
+    while (1)
+    {
+        uint8_t fwd    = (P3IN & BTN_FWD_P3)    ? 1 : 0;
+        uint8_t back   = (P2IN & BTN_BACK_P2)   ? 1 : 0;
+        uint8_t left   = (P2IN & BTN_LEFT_P2)   ? 1 : 0;
+        uint8_t right  = (P2IN & BTN_RIGHT_P2)  ? 1 : 0;
+        uint8_t clear  = (P2IN & BTN_CLEAR_P2)  ? 1 : 0;
+        uint8_t attack = (P3IN & BTN_ATTACK_P3) ? 1 : 0;
+
+        if (fwd && !prev_fwd)
+            send_pattern(CODE_FWD);
+
+        if (back && !prev_back)
+            send_pattern(CODE_BACK);
+
+        if (left && !prev_left)
+            send_pattern(CODE_LEFT);
+
+        if (right && !prev_right)
+            send_pattern(CODE_RIGHT);
+
+        if (clear && !prev_clear)
+            send_pattern(CODE_STOP);
+
+        if (attack && !prev_attack)
+            send_pattern(CODE_HAMMER);
+
+        prev_fwd    = fwd;
+        prev_back   = back;
+        prev_left   = left;
+        prev_right  = right;
+        prev_clear  = clear;
+        prev_attack = attack;
+
+        carrier_off();  // ensure quiet when idle
+    }
+}
