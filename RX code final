@@ -1,0 +1,389 @@
+// ======================================
+//      RX SIDE - MSP430FR6989
+//      TOGGLE COMMANDS, ROBUST PATTERNS, NO OVERCURRENT
+//      ENA: P2.7 / TB0.6
+//      ENB: P3.3 / TA1.1
+// ======================================
+#include <msp430fr6989.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================
+   USER TUNABLE PARAMETERS
+   ============================================================ */
+#define PWM_PERIOD        1000u      // ~1 kHz PWM
+#define DUTY_DRIVE        700u
+#define DUTY_TURN         700u
+
+#define BIT_TIME_MS       10u        // must match TX bit time
+
+/* ============================================================
+   IR COMMAND PATTERNS (MUST MATCH TX EXACTLY)
+   ============================================================ */
+/* New robust 6-bit patterns */
+static const uint8_t CODE_FWD[6]    = {1,0,1,1,1,0};   // 101110
+static const uint8_t CODE_BACK[6]   = {0,1,0,0,1,1};   // 010011
+static const uint8_t CODE_LEFT[6]   = {1,1,1,0,0,1};   // 111001
+static const uint8_t CODE_RIGHT[6]  = {0,0,0,1,1,0};   // 000110
+static const uint8_t CODE_STOP[6]   = {1,0,0,1,0,1};   // 100101
+static const uint8_t CODE_HAMMER[6] = {1,0,1,0,0,0};   // 011010
+
+/* ============================================================
+   PIN DEFINITIONS
+   ============================================================ */
+#define L_IN1      BIT2     // P2.2 -> IN1 (left motor)
+#define L_IN2      BIT3     // P1.3 -> IN2 (left motor)
+#define R_IN1      BIT7     // P3.7 -> IN3 (right motor)
+#define R_IN2      BIT6     // P3.6 -> IN4 (right motor)
+
+#define ENA        BIT7     // P2.7 -> TB0.6
+#define ENB        BIT3     // P3.3 -> TA1.1
+
+#define HAMMER_GATE BIT4    // P2.4 MOSFET gate
+
+#define IR_IN      BIT2     // P3.2 TSOP/NAND output (HIGH = IR = bit 1)
+
+/* Debug LEDs */
+#define LED_BIT0   BIT0     // P1.0
+#define LED_BIT1   BIT7     // P9.7
+
+/* ============================================================
+   COMMAND / STATE
+   ============================================================ */
+typedef enum {
+    CMD_NONE = 0,
+    CMD_FWD,
+    CMD_BACK,
+    CMD_LEFT,
+    CMD_RIGHT,
+    CMD_STOP,
+    CMD_HAMMER
+} cmd_t;
+
+typedef enum {
+    MOT_NONE = 0,
+    MOT_FWD,
+    MOT_BACK,
+    MOT_LEFT,
+    MOT_RIGHT
+} motion_t;
+
+static motion_t motion_state = MOT_NONE;
+static uint8_t  hammer_is_on = 0;
+
+/* Sliding 6-bit window */
+static uint8_t bit_buffer[6] = {0,0,0,0,0,0};
+
+/* To avoid double-trigger within one burst */
+static cmd_t last_cmd_seen = CMD_NONE;
+
+/* ============================================================
+   DELAY
+   ============================================================ */
+static void delay_ms(uint16_t ms)
+{
+    while(ms--)
+        __delay_cycles(1000);
+}
+
+/* ============================================================
+   MOTOR CONTROL
+   ============================================================ */
+static void coast_all(void)
+{
+    P2OUT &= ~L_IN1;
+    P1OUT &= ~L_IN2;
+    P3OUT &= ~(R_IN1 | R_IN2);
+}
+
+static void drive_forward(void)
+{
+    P2OUT &= ~L_IN1;
+    P1OUT |=  L_IN2;
+
+    P3OUT |=  R_IN1;
+    P3OUT &= ~R_IN2;
+}
+
+static void drive_back(void)
+{
+    P2OUT |=  L_IN1;
+    P1OUT &= ~L_IN2;
+
+    P3OUT &= ~R_IN1;
+    P3OUT |=  R_IN2;
+}
+
+static void drive_left(void)
+{
+    // left backward, right forward
+    P2OUT |=  L_IN1;
+    P1OUT &= ~L_IN2;
+
+    P3OUT |=  R_IN1;
+    P3OUT &= ~R_IN2;
+}
+
+static void drive_right(void)
+{
+    // left forward, right backward
+    P2OUT &= ~L_IN1;
+    P1OUT |=  L_IN2;
+
+    P3OUT &= ~R_IN1;
+    P3OUT |=  R_IN2;
+}
+
+static void set_ena(uint16_t d)
+{
+    if(d > PWM_PERIOD) d = PWM_PERIOD;
+    TB0CCR6 = d;
+}
+
+static void set_enb(uint16_t d)
+{
+    if(d > PWM_PERIOD) d = PWM_PERIOD;
+    TA1CCR1 = d;
+}
+
+static void apply_motion_state(void)
+{
+    switch (motion_state)
+    {
+        case MOT_FWD:
+            drive_forward();
+            set_ena(DUTY_DRIVE);
+            set_enb(DUTY_DRIVE);
+            break;
+        case MOT_BACK:
+            drive_back();
+            set_ena(DUTY_DRIVE);
+            set_enb(DUTY_DRIVE);
+            break;
+        case MOT_LEFT:
+            drive_left();
+            set_ena(DUTY_TURN);
+            set_enb(DUTY_TURN);
+            break;
+        case MOT_RIGHT:
+            drive_right();
+            set_ena(DUTY_TURN);
+            set_enb(DUTY_TURN);
+            break;
+        case MOT_NONE:
+        default:
+            set_ena(0);
+            set_enb(0);
+            coast_all();
+            break;
+    }
+}
+
+/* ============================================================
+   HAMMER CONTROL
+   ============================================================ */
+static void hammer_on(void)
+{
+    P2OUT |= HAMMER_GATE;
+    hammer_is_on = 1;
+}
+
+static void hammer_off(void)
+{
+    P2OUT &= ~HAMMER_GATE;
+    hammer_is_on = 0;
+}
+
+static void hammer_toggle(void)
+{
+    if (hammer_is_on) hammer_off();
+    else              hammer_on();
+}
+
+/* ============================================================
+   IO / TIMER INIT
+   ============================================================ */
+static void io_init(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+    PM5CTL0 &= ~LOCKLPM5;
+
+    /* LEDs */
+    P1DIR |= LED_BIT0;
+    P1OUT &= ~LED_BIT0;
+    P9DIR |= LED_BIT1;
+    P9OUT &= ~LED_BIT1;
+
+    /* Motor direction pins */
+    P2DIR |= L_IN1;
+    P1DIR |= L_IN2;
+    P3DIR |= (R_IN1 | R_IN2);
+
+    /* Hammer gate */
+    P2DIR |= HAMMER_GATE;
+    hammer_off();
+
+    /* IR input (after NAND inverter) */
+    P3DIR &= ~IR_IN;
+    P3REN |= IR_IN;
+    P3OUT |= IR_IN;   // pull-up
+
+    coast_all();
+}
+
+static void timers_init(void)
+{
+    /* ENA: TB0.6 on P2.7 */
+    P2DIR  |= ENA;
+    P2SEL0 |= ENA;
+    P2SEL1 &= ~ENA;
+
+    TB0CCR0  = PWM_PERIOD - 1;
+    TB0CCTL6 = OUTMOD_7;
+    TB0CCR6  = 0;
+    TB0CTL   = TBSSEL__SMCLK | MC__UP | TBCLR;
+
+    /* ENB: TA1.1 on P3.3 */
+    P3DIR  |= ENB;
+    P3SEL0 &= ~ENB;
+    P3SEL1 |=  ENB;
+
+    TA1CCR0  = PWM_PERIOD - 1;
+    TA1CCTL1 = OUTMOD_7;
+    TA1CCR1  = 0;
+    TA1CTL   = TASSEL__SMCLK | MC__UP | TACLR;
+}
+
+/* ============================================================
+   IR DECODE
+   ============================================================ */
+static uint8_t read_ir_bit(void)
+{
+    // AFTER NAND INVERTER: HIGH = IR PRESENT = bit 1
+    return (P3IN & IR_IN) ? 1 : 0;
+}
+
+static uint8_t match_pattern(const uint8_t *pattern)
+{
+    uint8_t i;
+    for(i = 0; i < 6; i++)
+    {
+        if(bit_buffer[i] != pattern[i])
+            return 0;
+    }
+    return 1;
+}
+
+static cmd_t detect_command(void)
+{
+    if (match_pattern(CODE_FWD))    return CMD_FWD;
+    if (match_pattern(CODE_BACK))   return CMD_BACK;
+    if (match_pattern(CODE_LEFT))   return CMD_LEFT;
+    if (match_pattern(CODE_RIGHT))  return CMD_RIGHT;
+    if (match_pattern(CODE_STOP))   return CMD_STOP;
+    if (match_pattern(CODE_HAMMER)) return CMD_HAMMER;
+    return CMD_NONE;
+}
+
+/* ============================================================
+   HANDLE COMMAND (TOGGLE LOGIC)
+   ============================================================ */
+static void handle_command(cmd_t cmd)
+{
+    switch (cmd)
+    {
+        case CMD_FWD:
+            if (motion_state == MOT_FWD)
+                motion_state = MOT_NONE;
+            else
+                motion_state = MOT_FWD;
+            apply_motion_state();
+            break;
+
+        case CMD_BACK:
+            if (motion_state == MOT_BACK)
+                motion_state = MOT_NONE;
+            else
+                motion_state = MOT_BACK;
+            apply_motion_state();
+            break;
+
+        case CMD_LEFT:
+            if (motion_state == MOT_LEFT)
+                motion_state = MOT_NONE;
+            else
+                motion_state = MOT_LEFT;
+            apply_motion_state();
+            break;
+
+        case CMD_RIGHT:
+            if (motion_state == MOT_RIGHT)
+                motion_state = MOT_NONE;
+            else
+                motion_state = MOT_RIGHT;
+            apply_motion_state();
+            break;
+
+        case CMD_STOP:
+            motion_state = MOT_NONE;
+            apply_motion_state();
+            hammer_off();     // global kill (motors + hammer)
+            break;
+
+        case CMD_HAMMER:
+            hammer_toggle();
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+int main(void)
+{
+    uint8_t i;
+
+    io_init();
+    timers_init();
+
+    while(1)
+    {
+        uint8_t bit = read_ir_bit();
+
+        /* Debug LEDs: show bit */
+        if(bit == 0)
+        {
+            P1OUT |= LED_BIT0;
+            P9OUT &= ~LED_BIT1;
+        }
+        else
+        {
+            P1OUT &= ~LED_BIT0;
+            P9OUT |=  LED_BIT1;
+        }
+
+        /* Shift sliding window */
+        for (i = 0; i < 5; i++)
+            bit_buffer[i] = bit_buffer[i+1];
+        bit_buffer[5] = bit;
+
+        /* Decode */
+        cmd_t cmd = detect_command();
+
+        /* Edge logic: only act when a new command appears */
+        if (cmd != CMD_NONE && cmd != last_cmd_seen)
+        {
+            handle_command(cmd);
+            last_cmd_seen = cmd;
+        }
+        else if (cmd == CMD_NONE)
+        {
+            last_cmd_seen = CMD_NONE;
+        }
+
+        delay_ms(BIT_TIME_MS);
+    }
+}
